@@ -1,6 +1,6 @@
 /*
  * NFC Tag Writer using Arduino Mega ADK, RFID-RC522, LCD and Keypad
- * This code can write data to MIFARE Classic cards with LCD interface
+ * This code can write data to MIFARE Classic cards with LCD interface and Serial Monitor interface
  * 
  * Hardware Connections:
  * RC522 Module    Arduino Mega ADK
@@ -61,7 +61,9 @@ enum MenuState {
   CHANGE_KEY,
   TEXT_INPUT,
   KEY_INPUT,
-  PROCESSING
+  PROCESSING,
+  SERIAL_TEXT_INPUT,
+  SERIAL_KEY_INPUT
 };
 
 // Character set for input
@@ -74,8 +76,9 @@ const int charSetSize = sizeof(charSet) - 1;
 MFRC522 mfrc522(SS_PIN, RST_PIN);
 LiquidCrystal lcd(LCD_RS, LCD_ENABLE, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
 
-// Default MIFARE key (factory default)
-MFRC522::MIFARE_Key key;
+// Multiple access keys
+MFRC522::MIFARE_Key keys[3];
+const int NUM_KEYS = 3;
 
 // Menu variables
 MenuState currentState = MAIN_MENU;
@@ -104,6 +107,10 @@ int keyCharIndex = 0;
 unsigned long lastButtonTime = 0;
 const unsigned long buttonDelay = 200;
 
+// Serial input variables
+String serialInput = "";
+bool serialInputComplete = false;
+
 void setup() {
   Serial.begin(9600);
   
@@ -116,9 +123,23 @@ void setup() {
   SPI.begin();
   mfrc522.PCD_Init();
   
-  // Prepare the key (used both as key A and key B)
+  // Prepare the keys
+  // Key 0: Default factory key (FF FF FF FF FF FF)
   for (byte i = 0; i < 6; i++) {
-    key.keyByte[i] = 0xFF;
+    keys[0].keyByte[i] = 0xFF;
+  }
+  
+  // Key 1: Custom key (D3 F7 D3 F7 D3 F7)
+  keys[1].keyByte[0] = 0xD3;
+  keys[1].keyByte[1] = 0xF7;
+  keys[1].keyByte[2] = 0xD3;
+  keys[1].keyByte[3] = 0xF7;
+  keys[1].keyByte[4] = 0xD3;
+  keys[1].keyByte[5] = 0xF7;
+  
+  // Key 2: User configurable key (starts as default)
+  for (byte i = 0; i < 6; i++) {
+    keys[2].keyByte[i] = 0xFF;
   }
   
   // Display startup message
@@ -126,12 +147,25 @@ void setup() {
   lcd.print("NFC Tag Writer");
   lcd.setCursor(0, 1);
   lcd.print("Initializing...");
+  
+  // Serial startup message
+  Serial.println("=================================");
+  Serial.println("NFC Tag Writer - Serial Interface");
+  Serial.println("=================================");
+  Serial.println("Initializing...");
+  Serial.println("Available access keys:");
+  Serial.println("1. FFFFFFFFFFFF (Factory default)");
+  Serial.println("2. D3F7D3F7D3F7 (Added key)");
+  Serial.println("3. FFFFFFFFFFFF (User configurable)");
+  
   delay(2000);
   
   displayMainMenu();
+  displaySerialMenu();
 }
 
 void loop() {
+  // Handle LCD/Keypad input
   int button = readButton();
   
   if (button != BTN_NONE && millis() - lastButtonTime > buttonDelay) {
@@ -139,7 +173,115 @@ void loop() {
     handleButton(button);
   }
   
+  // Handle Serial input
+  handleSerialInput();
+  
   delay(50);
+}
+
+void handleSerialInput() {
+  while (Serial.available()) {
+    char inChar = (char)Serial.read();
+    
+    if (inChar == '\n' || inChar == '\r') {
+      if (serialInput.length() > 0) {
+        serialInputComplete = true;
+        processSerialCommand();
+        serialInput = "";
+        serialInputComplete = false;
+      }
+    } else if (inChar == '\b' || inChar == 127) { // Backspace
+      if (serialInput.length() > 0) {
+        serialInput = serialInput.substring(0, serialInput.length() - 1);
+        Serial.print("\b \b"); // Erase character on terminal
+      }
+    } else if (inChar >= 32 && inChar <= 126) { // Printable characters
+      if (currentState == SERIAL_TEXT_INPUT && serialInput.length() < 16) {
+        serialInput += inChar;
+        Serial.print(inChar);
+      } else if (currentState == SERIAL_KEY_INPUT && serialInput.length() < 12) {
+        if ((inChar >= '0' && inChar <= '9') || (inChar >= 'A' && inChar <= 'F') || (inChar >= 'a' && inChar <= 'f')) {
+          serialInput += inChar;
+          Serial.print(inChar);
+        }
+      } else if (currentState == MAIN_MENU && serialInput.length() < 10) {
+        serialInput += inChar;
+        Serial.print(inChar);
+      }
+    }
+  }
+}
+
+void processSerialCommand() {
+  if (currentState == MAIN_MENU) {
+    int choice = serialInput.toInt();
+    if (choice >= 1 && choice <= 5) {
+      Serial.println();
+      executeSerialMenuOption(choice - 1);
+    } else {
+      Serial.println();
+      Serial.println("Invalid choice! Please enter 1-5.");
+      displaySerialMenu();
+    }
+  } else if (currentState == SERIAL_TEXT_INPUT) {
+    Serial.println();
+    Serial.println("Writing custom text: " + serialInput);
+    writeCustomText(serialInput);
+    currentState = MAIN_MENU;
+    displaySerialMenu();
+  } else if (currentState == SERIAL_KEY_INPUT) {
+    Serial.println();
+    if (serialInput.length() == 12) {
+      Serial.println("Changing user key to: " + serialInput);
+      changeKeyFromSerial(serialInput);
+    } else {
+      Serial.println("Invalid key! Must be 12 hex characters.");
+    }
+    currentState = MAIN_MENU;
+    displaySerialMenu();
+  }
+}
+
+void executeSerialMenuOption(int option) {
+  switch (option) {
+    case 0: // Write Default
+      Serial.println("Writing default text to card...");
+      writeCard();
+      break;
+    case 1: // Write Custom
+      Serial.println("Enter custom text (max 16 characters):");
+      Serial.print("> ");
+      currentState = SERIAL_TEXT_INPUT;
+      return; // Don't return to main menu yet
+    case 2: // Read Card
+      Serial.println("Reading card...");
+      readCard();
+      break;
+    case 3: // Format Card
+      Serial.println("Formatting card...");
+      formatCard();
+      break;
+    case 4: // Change Auth Key
+      Serial.println("Enter new user key (12 hex characters, e.g., FFFFFFFFFFFF):");
+      Serial.print("> ");
+      currentState = SERIAL_KEY_INPUT;
+      return; // Don't return to main menu yet
+  }
+  
+  // Return to main menu after operation
+  displaySerialMenu();
+}
+
+void displaySerialMenu() {
+  Serial.println();
+  Serial.println("=== NFC Tag Writer Menu ===");
+  Serial.println("1. Write Default Text");
+  Serial.println("2. Write Custom Text");
+  Serial.println("3. Read Card");
+  Serial.println("4. Format Card");
+  Serial.println("5. Change User Auth Key");
+  Serial.println();
+  Serial.print("Enter your choice (1-5): ");
 }
 
 int readButton() {
@@ -175,6 +317,7 @@ void handleButton(int button) {
       if (button == BTN_SELECT) {
         currentState = MAIN_MENU;
         displayMainMenu();
+        displaySerialMenu();
       }
       break;
   }
@@ -450,15 +593,30 @@ void executeKeyInput() {
   displayMainMenu();
 }
 
+// Try authentication with multiple keys
+bool authenticateWithKeys(byte trailerBlock) {
+  for (int i = 0; i < NUM_KEYS; i++) {
+    MFRC522::StatusCode status = mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, trailerBlock, &keys[i], &(mfrc522.uid));
+    if (status == MFRC522::STATUS_OK) {
+      Serial.print("Authentication successful with key ");
+      Serial.println(i + 1);
+      return true;
+    }
+  }
+  return false;
+}
+
 void writeCard() {
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("Place card...");
+  Serial.println("Place NFC card near reader...");
   
   if (!waitForCard()) {
     lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print("Failed!");
+    Serial.println("Operation failed - no card detected or timeout!");
     return;
   }
   
@@ -470,29 +628,29 @@ void writeCard() {
   byte block = 4;
   byte trailerBlock = 7;
   
-  MFRC522::StatusCode status;
-  
-  status = mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, trailerBlock, &key, &(mfrc522.uid));
-  if (status != MFRC522::STATUS_OK) {
+  if (!authenticateWithKeys(trailerBlock)) {
     lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print("Auth Failed!");
+    Serial.println("Authentication failed with all keys!");
     mfrc522.PICC_HaltA();
     mfrc522.PCD_StopCrypto1();
     return;
   }
   
-  status = mfrc522.MIFARE_Write(block, dataBlock, 16);
+  MFRC522::StatusCode status = mfrc522.MIFARE_Write(block, dataBlock, 16);
   if (status != MFRC522::STATUS_OK) {
     lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print("Write Failed!");
+    Serial.println("Write operation failed!");
   } else {
     lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print("Write Success!");
     lcd.setCursor(0, 1);
     lcd.print("Hello NFC!");
+    Serial.println("Successfully wrote 'Hello NFC!' to card");
   }
   
   mfrc522.PICC_HaltA();
@@ -503,11 +661,13 @@ void readCard() {
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("Place card...");
+  Serial.println("Place NFC card near reader...");
   
   if (!waitForCard()) {
     lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print("Failed!");
+    Serial.println("Operation failed - no card detected or timeout!");
     return;
   }
   
@@ -524,15 +684,23 @@ void readCard() {
   uidStr.toUpperCase();
   lcd.print(uidStr);
   
+  // Print full UID to serial
+  Serial.print("Card UID: ");
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    if (mfrc522.uid.uidByte[i] < 0x10) Serial.print("0");
+    Serial.print(mfrc522.uid.uidByte[i], HEX);
+    if (i < mfrc522.uid.size - 1) Serial.print(":");
+  }
+  Serial.println();
+  
   // Try to read block 4
   byte block = 4;
   byte trailerBlock = 7;
   byte buffer[18];
   byte size = sizeof(buffer);
   
-  MFRC522::StatusCode status = mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, trailerBlock, &key, &(mfrc522.uid));
-  if (status == MFRC522::STATUS_OK) {
-    status = mfrc522.MIFARE_Read(block, buffer, &size);
+  if (authenticateWithKeys(trailerBlock)) {
+    MFRC522::StatusCode status = mfrc522.MIFARE_Read(block, buffer, &size);
     if (status == MFRC522::STATUS_OK) {
       lcd.setCursor(0, 1);
       lcd.print("Data:");
@@ -547,13 +715,34 @@ void readCard() {
         }
       }
       lcd.print(text);
+      
+      // Print full data to serial
+      Serial.print("Data (Block 4): ");
+      for (byte i = 0; i < 16; i++) {
+        if (buffer[i] >= 32 && buffer[i] <= 126) {
+          Serial.print((char)buffer[i]);
+        } else {
+          Serial.print(".");
+        }
+      }
+      Serial.println();
+      
+      Serial.print("Hex: ");
+      for (byte i = 0; i < 16; i++) {
+        if (buffer[i] < 0x10) Serial.print("0");
+        Serial.print(buffer[i], HEX);
+        Serial.print(" ");
+      }
+      Serial.println();
     } else {
       lcd.setCursor(0, 1);
       lcd.print("Read Failed!");
+      Serial.println("Read operation failed!");
     }
   } else {
     lcd.setCursor(0, 1);
     lcd.print("Auth Failed!");
+    Serial.println("Authentication failed with all keys!");
   }
   
   mfrc522.PICC_HaltA();
@@ -564,11 +753,13 @@ void writeCustomText(String textToWrite) {
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("Place card...");
+  Serial.println("Place NFC card near reader...");
   
   if (!waitForCard()) {
     lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print("Failed!");
+    Serial.println("Operation failed - no card detected or timeout!");
     return;
   }
   
@@ -584,21 +775,22 @@ void writeCustomText(String textToWrite) {
   byte block = 4;
   byte trailerBlock = 7;
   
-  MFRC522::StatusCode status = mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, trailerBlock, &key, &(mfrc522.uid));
-  if (status != MFRC522::STATUS_OK) {
+  if (!authenticateWithKeys(trailerBlock)) {
     lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print("Auth Failed!");
+    Serial.println("Authentication failed with all keys!");
     mfrc522.PICC_HaltA();
     mfrc522.PCD_StopCrypto1();
     return;
   }
   
-  status = mfrc522.MIFARE_Write(block, dataBlock, 16);
+  MFRC522::StatusCode status = mfrc522.MIFARE_Write(block, dataBlock, 16);
   if (status != MFRC522::STATUS_OK) {
     lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print("Write Failed!");
+    Serial.println("Write operation failed!");
   } else {
     lcd.clear();
     lcd.setCursor(0, 0);
@@ -606,6 +798,7 @@ void writeCustomText(String textToWrite) {
     lcd.setCursor(0, 1);
     String displayText = textToWrite.substring(0, 16);
     lcd.print(displayText);
+    Serial.println("Successfully wrote '" + textToWrite + "' to card");
   }
   
   mfrc522.PICC_HaltA();
@@ -617,13 +810,14 @@ void changeKey() {
     lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print("Invalid Key!");
+    Serial.println("Invalid key length! Must be 12 hex characters.");
     return;
   }
   
-  // Parse hex string to bytes
+  // Parse hex string to bytes for user configurable key (key 2)
   for (int i = 0; i < 6; i++) {
     String byteString = keyInput.substring(i * 2, i * 2 + 2);
-    key.keyByte[i] = strtoul(byteString.c_str(), NULL, 16);
+    keys[2].keyByte[i] = strtoul(byteString.c_str(), NULL, 16);
   }
   
   lcd.clear();
@@ -631,28 +825,37 @@ void changeKey() {
   lcd.print("Key Updated!");
   lcd.setCursor(0, 1);
   lcd.print(keyInput);
+  Serial.println("User authentication key updated to: " + keyInput);
+}
+
+void changeKeyFromSerial(String newKey) {
+  // Parse hex string to bytes for user configurable key (key 2)
+  for (int i = 0; i < 6; i++) {
+    String byteString = newKey.substring(i * 2, i * 2 + 2);
+    keys[2].keyByte[i] = strtoul(byteString.c_str(), NULL, 16);
+  }
+  
+  Serial.println("User authentication key updated to: " + newKey);
 }
 
 void formatCard() {
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("Place card...");
+  Serial.println("Place NFC card near reader...");
   
   if (!waitForCard()) {
     lcd.clear();
     lcd.setCursor(0, 0);
     lcd.print("Failed!");
+    Serial.println("Operation failed - no card detected or timeout!");
     return;
-  }
-  
-  // Reset key to default
-  for (byte i = 0; i < 6; i++) {
-    key.keyByte[i] = 0xFF;
   }
   
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("Formatting...");
+  Serial.println("Formatting card...");
   
   // Clear data blocks
   byte emptyBlock[16];
@@ -663,8 +866,7 @@ void formatCard() {
     byte firstBlock = sector * 4;
     byte trailerBlock = firstBlock + 3;
     
-    MFRC522::StatusCode status = mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, trailerBlock, &key, &(mfrc522.uid));
-    if (status == MFRC522::STATUS_OK) {
+    if (authenticateWithKeys(trailerBlock)) {
       for (byte blockOffset = 0; blockOffset < 3; blockOffset++) {
         byte blockNumber = firstBlock + blockOffset;
         if (mfrc522.MIFARE_Write(blockNumber, emptyBlock, 16) != MFRC522::STATUS_OK) {
@@ -672,6 +874,9 @@ void formatCard() {
           break;
         }
       }
+    } else {
+      success = false;
+      break;
     }
   }
   
@@ -679,8 +884,10 @@ void formatCard() {
   lcd.setCursor(0, 0);
   if (success) {
     lcd.print("Format Success!");
+    Serial.println("Card formatted successfully!");
   } else {
     lcd.print("Format Failed!");
+    Serial.println("Card formatting failed!");
   }
   
   mfrc522.PICC_HaltA();
@@ -697,6 +904,7 @@ bool waitForCard() {
       if (piccType == MFRC522::PICC_TYPE_MIFARE_MINI ||  
           piccType == MFRC522::PICC_TYPE_MIFARE_1K ||
           piccType == MFRC522::PICC_TYPE_MIFARE_4K) {
+        Serial.println("Compatible NFC card detected!");
         return true;
       }
       mfrc522.PICC_HaltA(); 
@@ -712,4 +920,4 @@ void dumpByteArray(byte *buffer, byte bufferSize) {
     Serial.print(buffer[i] < 0x10 ? " 0" : " ");
     Serial.print(buffer[i], HEX);
   }
-  }
+}
